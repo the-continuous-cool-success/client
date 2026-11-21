@@ -1,7 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
-const { execFile, execSync } = require("node:child_process");
+const { execFile, execSync, spawn } = require("node:child_process");
 const fs = require("node:fs");
 const http = require("node:http");
 const https = require("node:https");
@@ -105,6 +105,9 @@ async function ensureWinKeyServerExe() {
     );
   }
   console.log(`WinKeyServer ready: ${exe}`);
+  if (isWslLinux()) {
+    return preferWindowsMountWinKeyServer(exe);
+  }
   return exe;
 }
 
@@ -163,6 +166,204 @@ async function downloadKeyspyWinBinary(keyspyRoot) {
   return exePath;
 }
 
+function windowsCmdExe() {
+  const cmd = "/mnt/c/Windows/System32/cmd.exe";
+  return isWslLinux() && fs.existsSync(cmd) ? cmd : null;
+}
+
+function windowsNodeExe() {
+  if (!isWslLinux()) {
+    return null;
+  }
+  for (const candidate of [
+    "/mnt/c/Program Files/nodejs/node.exe",
+    "/mnt/c/Program Files (x86)/nodejs/node.exe",
+  ]) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function toWin32PathForWsl(linuxPath) {
+  if (!linuxPath || !isWslLinux()) {
+    return linuxPath;
+  }
+  if (/^[A-Za-z]:[\\/]/.test(linuxPath)) {
+    return linuxPath;
+  }
+  try {
+    return execSync(`wslpath -w ${JSON.stringify(linuxPath)}`, { encoding: "utf8" }).trim();
+  } catch {
+    return linuxPath;
+  }
+}
+
+function preferWindowsMountWinKeyServer(exePath) {
+  if (!isWslLinux() || exePath.startsWith("/mnt/")) {
+    return exePath;
+  }
+  const dest = "/mnt/c/Windows/Temp/winc-WinKeyServer.exe";
+  try {
+    fs.copyFileSync(exePath, dest);
+    return dest;
+  } catch {
+    return exePath;
+  }
+}
+
+async function startWslWinKeyServer(keyServer, serverPath) {
+  const target = toWin32PathForWsl(preferWindowsMountWinKeyServer(serverPath));
+  const cmd = windowsCmdExe();
+  const { isSpawnEventSupported } = require("keyspy/dist/utils");
+  if (cmd) {
+    keyServer.proc = execFile(cmd, ["/d", "/s", "/c", target], { maxBuffer: Number.POSITIVE_INFINITY });
+  } else {
+    keyServer.proc = execFile(target, { maxBuffer: Number.POSITIVE_INFINITY });
+  }
+  const config = keyServer.config;
+  if (config.onInfo) {
+    keyServer.proc.stderr?.on("data", (data) => config.onInfo?.(data.toString()));
+  }
+  const onError = config.onError;
+  if (onError) {
+    keyServer.proc.on("close", onError);
+  }
+  keyServer.proc.stdout?.on("data", (data) => {
+    const events = keyServer._getEventData(data);
+    for (const { event, eventId } of events) {
+      const stopPropagation = !!keyServer.listener(event);
+      keyServer.proc.stdin?.write(`${stopPropagation ? "1" : "0"},${eventId}\n`);
+    }
+  });
+  return new Promise((resolve, reject) => {
+    keyServer.proc.on("error", reject);
+    if (isSpawnEventSupported()) {
+      keyServer.proc.on("spawn", resolve);
+    } else {
+      setTimeout(resolve, 200);
+    }
+  });
+}
+
+class WslWindowsHelper {
+  constructor() {
+    this.child = null;
+    this.lineQueue = [];
+    this.lineWaiters = [];
+    this.ready = false;
+  }
+
+  pushLine(line) {
+    const waiter = this.lineWaiters.shift();
+    if (waiter) {
+      waiter(line);
+    } else {
+      this.lineQueue.push(line);
+    }
+  }
+
+  waitLine(timeoutMs = 4000) {
+    return new Promise((resolve, reject) => {
+      if (this.lineQueue.length) {
+        resolve(this.lineQueue.shift());
+        return;
+      }
+      const timer = setTimeout(() => {
+        const idx = this.lineWaiters.indexOf(onLine);
+        if (idx !== -1) {
+          this.lineWaiters.splice(idx, 1);
+        }
+        reject(new Error("WSL Windows helper timeout"));
+      }, timeoutMs);
+      const onLine = (line) => {
+        clearTimeout(timer);
+        resolve(line);
+      };
+      this.lineWaiters.push(onLine);
+    });
+  }
+
+  async start() {
+    const nodeExe = windowsNodeExe();
+    const helperJs = path.join(__dirname, "wsl-win-helper.js");
+    if (!nodeExe || !fs.existsSync(helperJs)) {
+      throw new Error(
+        "Install Node.js on Windows (https://nodejs.org) so WSL can run wsl-win-helper.js for keyboard text + clipboard.",
+      );
+    }
+    const winHelper = toWin32PathForWsl(helperJs);
+    this.child = spawn(nodeExe, [winHelper], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    this.child.stdout.setEncoding("utf8");
+    this.child.stdout.on("data", (chunk) => {
+      const lines = String(chunk).split(/\n/);
+      for (const line of lines) {
+        if (line.length) {
+          this.pushLine(line);
+        }
+      }
+    });
+    this.child.stderr.on("data", (d) => {
+      const text = String(d).trim();
+      if (text) {
+        console.error("[wsl-win-helper]", text);
+      }
+    });
+    this.child.on("error", (err) => console.error("[wsl-win-helper]", err.message));
+    this.child.stdin.write("ping\n");
+    const pong = await this.waitLine(8000);
+    if (pong !== "pong") {
+      throw new Error("WSL Windows helper failed to start");
+    }
+    this.ready = true;
+  }
+
+  request(line) {
+    if (!this.child?.stdin.writable) {
+      return Promise.reject(new Error("WSL helper not running"));
+    }
+    this.child.stdin.write(`${line}\n`);
+    return this.waitLine();
+  }
+
+  async readClipboardText() {
+    const line = await this.request("clip");
+    if (!line.startsWith("CLIPB64:")) {
+      return null;
+    }
+    try {
+      return Buffer.from(line.slice(8), "base64").toString("utf8");
+    } catch {
+      return null;
+    }
+  }
+
+  async toChar(vKey, scanCode, shiftHeld, capsOn) {
+    if (vKey == null || scanCode == null) {
+      return null;
+    }
+    const line = await this.request(`char ${vKey} ${scanCode} ${shiftHeld ? 1 : 0} ${capsOn ? 1 : 0}`);
+    if (!line) {
+      return null;
+    }
+    return line.length === 1 ? line : line;
+  }
+
+  async readCapsLock() {
+    const line = await this.request("caps");
+    return line === "1";
+  }
+
+  stop() {
+    if (this.child) {
+      this.child.kill();
+      this.child = null;
+    }
+    this.ready = false;
+  }
+}
+
 function createWslWinKeyboardListener(windowsConfig) {
   const { WinKeyServer } = require("keyspy/dist/platforms/windows/index.js");
   const listeners = [];
@@ -196,6 +397,9 @@ function createWslWinKeyboardListener(windowsConfig) {
     return stopPropagation;
   };
   const keyServer = new WinKeyServer(baseListener, windowsConfig);
+  if (isWslLinux() && windowsConfig.serverPath) {
+    keyServer.start = () => startWslWinKeyServer(keyServer, windowsConfig.serverPath);
+  }
   return {
     async addListener(listener) {
       listeners.push(listener);
@@ -212,6 +416,9 @@ function createWslWinKeyboardListener(windowsConfig) {
 
 /** Windows: map key name to typed character via ToUnicodeEx (correct case + symbols). */
 function createWindowsTypableCharResolver() {
+  if (isWslLinux()) {
+    return null;
+  }
   if (process.platform !== "win32") {
     return null;
   }
@@ -824,6 +1031,13 @@ function createTextBuffer(typingState) {
     getText() {
       return buffer;
     },
+    appendChar(ch) {
+      if (ch) {
+        buffer += ch;
+        return true;
+      }
+      return false;
+    },
     appendFromKey(record, isDown) {
       const key = record.key;
       if (MODIFIERS.has(key)) {
@@ -1028,22 +1242,38 @@ function keyspyLogInfo(msg) {
   console.error(`[keyspy] ${text}`);
 }
 
-function readClipboardText(callback) {
+function readClipboardText(callback, wslHelper) {
+  if (wslHelper?.ready) {
+    wslHelper
+      .readClipboardText()
+      .then((text) => callback(text))
+      .catch(() => callback(null));
+    return;
+  }
   const ps = windowsPowerShellExe();
   if (!ps) {
     callback(null);
     return;
   }
+  const cmd = windowsCmdExe();
+  const psCommand = "Get-Clipboard -Raw -ErrorAction SilentlyContinue; if (-not $?) { try { Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::GetText() } catch { '' } }";
+  if (cmd && isWslLinux()) {
+    execFile(
+      cmd,
+      ["/d", "/s", "/c", ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCommand],
+      { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout) => {
+        callback(err ? null : stdout ?? "");
+      },
+    );
+    return;
+  }
   execFile(
     ps,
-    ["-NoProfile", "-STA", "-Command", CLIPBOARD_PS_COMMAND],
+    ["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", CLIPBOARD_PS_COMMAND],
     { encoding: "utf8", maxBuffer: 4 * 1024 * 1024, windowsHide: true },
     (err, stdout) => {
-      if (err) {
-        callback(null);
-        return;
-      }
-      callback(stdout ?? "");
+      callback(err ? null : stdout ?? "");
     },
   );
 }
@@ -1062,7 +1292,7 @@ function normalizeClipboardText(raw, maxChars = MAX_CLIPBOARD_CHARS) {
   return text;
 }
 
-function createClipboardMonitor({ intervalMs, onCapture, maxChars = MAX_CLIPBOARD_CHARS }) {
+function createClipboardMonitor({ intervalMs, onCapture, maxChars = MAX_CLIPBOARD_CHARS, wslHelper = null }) {
   let lastDigest = null;
   let timer = null;
   let reading = false;
@@ -1092,12 +1322,13 @@ function createClipboardMonitor({ intervalMs, onCapture, maxChars = MAX_CLIPBOAR
       }
       lastDigest = nextDigest;
       onCapture(text);
-    });
+    }, wslHelper);
   }
 
   return {
     start() {
-      if (!windowsPowerShellExe() || !intervalMs || intervalMs < 200) {
+      const canRead = wslHelper?.ready || windowsPowerShellExe();
+      if (!canRead || !intervalMs || intervalMs < 200) {
         return false;
       }
       tick(true);
@@ -1184,10 +1415,27 @@ async function main() {
   let shouldRun = true;
   let reconnectTimer = null;
   let activeRelayBase = options.server;
+  let wslHelper = null;
+  if (isWslLinux()) {
+    wslHelper = new WslWindowsHelper();
+    try {
+      await wslHelper.start();
+      console.log("WSL Windows helper ready (keyboard layout + clipboard).");
+      void wslHelper.readCapsLock().then((on) => {
+        wslCapsLock = on;
+      });
+    } catch (err) {
+      console.warn(`WSL helper not available: ${err.message}`);
+      wslHelper = null;
+    }
+  }
   const resolveWindowsChar = createWindowsTypableCharResolver();
   if (resolveWindowsChar) {
     console.log("Using Windows keyboard layout for typed characters (case + symbols).");
+  } else if (wslHelper) {
+    console.log("Using Windows keyboard layout via WSL helper (case + symbols).");
   }
+  let wslCapsLock = false;
   const typingState = createTypingState(resolveWindowsChar);
   const textBuffer = createTextBuffer(typingState);
 
@@ -1243,6 +1491,7 @@ async function main() {
 
   const clipboardMonitor = createClipboardMonitor({
     intervalMs: options.clipboardMs,
+    wslHelper,
     onCapture: (text) => {
       sendPayload({
         type: "clipboard",
@@ -1304,10 +1553,25 @@ async function main() {
     if (record?.state === "DOWN") {
       if (record.type === "keyboard" && (record.key === "CAPS LOCK" || record.key === "CAPSLOCK")) {
         typingState.toggleCapsLock();
+        if (wslHelper) {
+          void wslHelper.readCapsLock().then((on) => {
+            wslCapsLock = on;
+          });
+        }
       }
       if (record.type === "keyboard" && !isEnterKey(record.key)) {
-        const changed = textBuffer.appendFromKey(record, isDown);
-        if (changed) {
+        if (wslHelper && record.vKey != null && record.scanCode != null) {
+          const shiftHeld = isShiftHeld(record.modifiers, isDown);
+          void wslHelper.toChar(record.vKey, record.scanCode, shiftHeld, wslCapsLock).then((ch) => {
+            if (ch && textBuffer.appendChar(ch)) {
+              sendPayload(typingPreviewPayload(textBuffer, agentMeta));
+              return;
+            }
+            if (textBuffer.appendFromKey(record, isDown)) {
+              sendPayload(typingPreviewPayload(textBuffer, agentMeta));
+            }
+          });
+        } else if (textBuffer.appendFromKey(record, isDown)) {
           sendPayload(typingPreviewPayload(textBuffer, agentMeta));
         }
       }
@@ -1331,6 +1595,7 @@ async function main() {
     const tail = textBuffer.flush("enter", agentMeta);
     if (tail) sendPayload(tail);
     keyboard?.kill();
+    wslHelper?.stop();
     disconnectSocket();
     if (logStream) logStream.end();
     process.exit(0);
