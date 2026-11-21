@@ -1,7 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
-const { execFile } = require("node:child_process");
+const { execFile, execSync } = require("node:child_process");
 const fs = require("node:fs");
 const http = require("node:http");
 const https = require("node:https");
@@ -89,7 +89,11 @@ async function ensureWinKeyServerExe() {
     throw new Error("keyspy is not installed. In the client folder run: npm install");
   }
   console.log("WinKeyServer.exe not found — downloading keyspy Windows binary…");
-  await runKeyspyBinaryDownload(root);
+  if (isWslLinux()) {
+    await downloadKeyspyWinBinary(root);
+  } else {
+    await runKeyspyBinaryDownload(root);
+  }
   exe = findWinKeyServerExe();
   if (!exe) {
     throw new Error(
@@ -102,6 +106,108 @@ async function ensureWinKeyServerExe() {
   }
   console.log(`WinKeyServer ready: ${exe}`);
   return exe;
+}
+
+function downloadFileHttps(url, dest) {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(dest);
+    const fetch = (requestUrl) => {
+      https
+        .get(requestUrl, (response) => {
+          if (response.statusCode === 301 || response.statusCode === 302) {
+            const next = response.headers.location;
+            if (!next) {
+              reject(new Error("Redirect without location"));
+              return;
+            }
+            fetch(next);
+            return;
+          }
+          if (response.statusCode !== 200) {
+            reject(new Error(`Download failed: HTTP ${response.statusCode}`));
+            return;
+          }
+          response.pipe(file);
+          file.on("finish", () => {
+            file.close(resolve);
+          });
+        })
+        .on("error", reject);
+    };
+    file.on("error", reject);
+    fetch(url);
+  });
+}
+
+async function downloadKeyspyWinBinary(keyspyRoot) {
+  const runtimeDir = path.join(keyspyRoot, "runtime");
+  const exePath = path.join(runtimeDir, "WinKeyServer.exe");
+  if (fs.existsSync(exePath)) {
+    return exePath;
+  }
+  fs.mkdirSync(runtimeDir, { recursive: true });
+  const version = require(path.join(keyspyRoot, "package.json")).version;
+  const archive = "keyspy-win32-x64.tar.gz";
+  const downloadUrl = `https://github.com/teomyth/keyspy/releases/download/v${version}/${archive}`;
+  const archivePath = path.join(runtimeDir, archive);
+  await downloadFileHttps(downloadUrl, archivePath);
+  execSync(`tar -xzf "${archivePath}" -C "${runtimeDir}"`, { stdio: "inherit" });
+  try {
+    fs.unlinkSync(archivePath);
+  } catch {
+    /* ignore */
+  }
+  if (!fs.existsSync(exePath)) {
+    throw new Error("WinKeyServer.exe missing after download — check network and tar.");
+  }
+  return exePath;
+}
+
+function createWslWinKeyboardListener(windowsConfig) {
+  const { WinKeyServer } = require("keyspy/dist/platforms/windows/index.js");
+  const listeners = [];
+  const isDown = {};
+  const baseListener = (event) => {
+    if (event.name) {
+      if (event.state === "DOWN") {
+        isDown[event.name] = true;
+      } else if (event.state === "UP") {
+        isDown[event.name] = false;
+      }
+    }
+    let stopPropagation = false;
+    for (const onKey of listeners) {
+      try {
+        const res = onKey(event, isDown);
+        if (res instanceof Object) {
+          if (res.stopPropagation) {
+            stopPropagation = true;
+          }
+          if (res.stopImmediatePropagation) {
+            break;
+          }
+        } else if (res) {
+          stopPropagation = true;
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    }
+    return stopPropagation;
+  };
+  const keyServer = new WinKeyServer(baseListener, windowsConfig);
+  return {
+    async addListener(listener) {
+      listeners.push(listener);
+      if (listeners.length === 1) {
+        await keyServer.start();
+      }
+    },
+    kill() {
+      listeners.length = 0;
+      keyServer.stop();
+    },
+  };
 }
 
 /** Windows: map key name to typed character via ToUnicodeEx (correct case + symbols). */
@@ -896,10 +1002,8 @@ function analyzeCaptureEnvironment() {
   if (isWslLinux()) {
     return {
       kind: "wsl",
-      captureKeyboardMouse: false,
+      captureKeyboardMouse: true,
       captureClipboard: Boolean(windowsPowerShellExe()),
-      hint:
-        "You are in WSL/Linux Node. Keyboard and mouse only work from native Windows PowerShell or CMD on the capture PC (same client folder, npm start).",
     };
   }
   if (process.platform === "linux") {
@@ -1066,7 +1170,9 @@ async function main() {
   const relayHost = hostFromServerInput(options.server);
   console.log(`Client PC: ${agentMeta.clientName} (${agentMeta.clientIp})`);
   console.log(`VPS: ${relayHost}`);
-  if (captureEnv.hint) {
+  if (captureEnv.kind === "wsl") {
+    console.log("WSL mode — Windows desktop keyboard, mouse, and clipboard.");
+  } else if (captureEnv.hint) {
     console.warn(`Note: ${captureEnv.hint}`);
   }
   let logStream = options.logFile ? fs.createWriteStream(options.logFile, { flags: "a" }) : null;
@@ -1160,15 +1266,19 @@ async function main() {
       onError: (c) => console.error(`[keyspy ${c}]`),
       onInfo: keyspyLogInfo,
     };
-    if (process.platform === "win32") {
+    if (process.platform === "win32" || isWslLinux()) {
       windowsKeyspyConfig.serverPath = await ensureWinKeyServerExe();
     }
 
-    keyboard = new GlobalKeyboardListener({
-      windows: windowsKeyspyConfig,
-      mac: { onError: (c) => console.error(`[keyspy ${c}]`), onInfo: keyspyLogInfo },
-      x11: { onError: (c) => console.error(`[keyspy ${c}]`), onInfo: keyspyLogInfo },
-    });
+    if (isWslLinux()) {
+      keyboard = createWslWinKeyboardListener(windowsKeyspyConfig);
+    } else {
+      keyboard = new GlobalKeyboardListener({
+        windows: windowsKeyspyConfig,
+        mac: { onError: (c) => console.error(`[keyspy ${c}]`), onInfo: keyspyLogInfo },
+        x11: { onError: (c) => console.error(`[keyspy ${c}]`), onInfo: keyspyLogInfo },
+      });
+    }
 
     await keyboard.addListener((event, isDown) => {
     const keyName = event.name ?? "UNKNOWN";
@@ -1209,7 +1319,8 @@ async function main() {
     return false;
     });
 
-    console.log("Capturing keyboard + mouse. Ctrl+C to stop.");
+    const capLabel = captureEnv.kind === "wsl" ? " (Windows desktop via WSL)" : "";
+    console.log(`Capturing keyboard + mouse${capLabel}. Ctrl+C to stop.`);
   } else {
     console.log("Relay only — no keyboard/mouse capture on this runtime. Ctrl+C to stop.");
   }
