@@ -1,0 +1,21 @@
+{
+  "name": "winc-client",
+  "version": "3.0.0",
+  "description": "Single-file keyboard client — npm install && npm start",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "postinstall": "node ./node_modules/keyspy/scripts/download-binaries.js",
+    "download-keyspy": "node ./node_modules/keyspy/scripts/download-binaries.js"
+  },
+  "license": "ISC",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "keyspy": "^1.1.1",
+    "koffi": "^2.16.3",
+    "ws": "^8.22.0"
+  }
+}

